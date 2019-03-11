@@ -7,6 +7,8 @@ import pickle
 import json
 import re
 
+import multiprocessing
+
 import tensorflow as tf
 import numpy as np
 from tensorflow.contrib import slim
@@ -20,6 +22,11 @@ except ImportError:
 import moviepy
 import moviepy.editor
 import imageio
+
+def permanent_storage_writer(input_queue, permanent_directory, temp_directory):
+    while True:
+        input_queue.get()
+        write_to_permanent()
 
 # Function take a subclip object defined by moviepy and creates a numpy array of # size of the subclip over the number of frames (numofframes)
 # Returns the numpy array that should be saved
@@ -50,8 +57,8 @@ def build_video_features(movie_dir, fname, date, position,
                          cage_positions, sess, endpoints, seq_input,
                          write_size = 10 * 60,
                          overlap = 10):
-    print("Building Video Feature Array for {:s}, {:s}, {:s}".format(fname, date, position))
-    
+    print("Building Video Feature Array for {:s}, {:s}, {:s}, {:s}".format(fname, date, position, animal_id))
+
     vid = moviepy.editor.VideoFileClip(os.path.join(movie_dir, fname))
     
     clip = moviepy.video.fx.all.crop(
@@ -61,9 +68,15 @@ def build_video_features(movie_dir, fname, date, position,
 
     duration = vid.duration
     niters = math.ceil(duration/write_size)
-    pbar = tqdm.tqdm(total=(vid.duration + (niters - 1) * overlap))
 
+
+    pbar = tqdm.tqdm(total=(vid.duration + (niters - 1) * overlap))
     for i in range(niters):
+        # check if features already exist
+        feature_fname = "{:s}_{:s}_{:s}_{:s}_{:d}_{:s}.npz".format(date, position, animal_id, fname, i, "PreLogitsFlatten")
+        feature_path = os.path.join(feature_folder, date, position, feature_fname)
+        if os.path.exists(feature_path):
+            continue
         clip_start = max(0, i * write_size - overlap)
         clip_end = min(clip.duration, (i + 1) * write_size)
         vid_clip = clip.subclip(clip_start, clip_end)
@@ -72,6 +85,7 @@ def build_video_features(movie_dir, fname, date, position,
                                                pbar=pbar)
         write_features(last_layer, date, position, animal_id, fname, clip_start,
                        i, "PreLogitsFlatten", feature_folder)
+    pbar.close()
 
 def build_video_feature_array(sess, clip, end_points, seq_input, window=10, pbar=None):
     duration = int(clip.duration)
@@ -99,15 +113,14 @@ def build_video_feature_array(sess, clip, end_points, seq_input, window=10, pbar
 image_size = inception.inception_v4.default_image_size
 
 rat_video_folder = "/home/aruch/sherlock/mwintermark/rat_videos"
-rat_video_feature_folder = "/home/aruch/seizure-detection/video_features"
+rat_video_feature_folder = "/run/media/aruch/glacier/video_features"
 
 with open("position_annotations.json") as f:
     position_annotations = json.load(f)
 
 VID_PAT = re.compile("(\w+).(MPG|MP4)$")
 
-dates = ["Jan " + str(x) + " 2019" for x in range(18, 32) if x != 19]
-
+dates = ["Jan " + str(x) + " 2019" for x in range(18, 32) if x not in [19]]
 
 seq_input = tf.placeholder(tf.int8, (None, None, None, 3))
 processed_images = tf.image.convert_image_dtype(seq_input, dtype=tf.float32)
