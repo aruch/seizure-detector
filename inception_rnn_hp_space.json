@@ -1,0 +1,1 @@
+{"rnn_size": [64, 128, 256, 512], "learning_rate": {"min": 1e-07, "max": 0.001, "log_sample": true}, "false_neg_pen": {"min": 30, "max": 1000, "log_sample": true}, "minibatch_proportion": [0.03125, 0.0625, 0.125], "minibatch_size": [64, 128], "reg_pen": {"min": 0.0005, "max": 0.05, "log_sample": true}, "window_size": [5, 10, 20]}
