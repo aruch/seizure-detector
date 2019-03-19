@@ -49,7 +49,7 @@ def feature_filename_to_fields(filename):
         "video_file": video_id,
         "video_id": video_id[:-4],
         "start_time": max((int(i) * 600 - 10), 0),
-        "video_chunk_id": i,
+        "video_chunk_id": int(i),
         "layer": layer
     }
 

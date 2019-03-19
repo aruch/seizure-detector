@@ -5,11 +5,14 @@ import logging
 import annotation_processor
 import numpy as np
 import random
+import skimage
 import os
 import threading
 import uuid
 import tqdm
 import math
+import moviepy
+import moviepy.editor
 
 import tensorflow as tf
 import json
@@ -125,9 +128,13 @@ class SeizureDetector:
             filenames = self.dev_files
         else:
             filenames = self.choose_epoch_files(self.files_per_epoch)
-        self.loaders[epoch] = threading.Thread(target=self.load_feature_files,
-                                               args=(filenames, epoch))
-        self.loaders[epoch].start()
+        if self.architecture == "inception_rnn":
+            self.loaders[epoch] = threading.Thread(target=self.load_feature_files,
+                                                   args=(filenames, epoch))
+            self.loaders[epoch].start()
+
+        else:
+            self.epoch_filenames = filenames
 
     def set_n_minibatches(self):
         n_positive_examples = len(self.pos_example_indices)
@@ -146,20 +153,27 @@ class SeizureDetector:
         self.n_minibatches = min(int(x/self.batch_size) * 5, int(1000/z))
 
     def setup_dev(self):
-        epoch = "dev"
-        self.loaders[epoch].join()
-        self.dev_examples = self.epoch_example_dict[epoch]
+        if self.architecture == "inception_rnn":
+            epoch = "dev"
+            self.loaders[epoch].join()
+            self.dev_examples = self.epoch_example_dict[epoch]
+        print("building dev times")
         self.epoch_positive_negative_times(dev=True)
+        print("done building dev times")
 
     def setup_epoch(self, epoch):
-        self.loaders[epoch].join()
-        self.epoch_examples = self.epoch_example_dict[epoch]
-        self.epoch_filenames = list(self.epoch_examples.keys())
+        if self.architecture == "inception_rnn":
+            self.loaders[epoch].join()
+            self.epoch_examples = self.epoch_example_dict[epoch]
+            
+            if epoch > 0:
+                del self.epoch_example_dict[epoch - 1]
 
-        if epoch > 0:
-            del self.epoch_example_dict[epoch - 1]
+            self.epoch_filenames = list(self.epoch_examples.keys())
 
+        print("building epoch times")
         self.epoch_positive_negative_times()
+        print("done building epoch times")
         self.set_n_minibatches()
 
     def get_dev_stats(self):
@@ -352,16 +366,29 @@ class SeizureDetector:
 
         if dev:
             filenames = self.dev_files
-            examples = self.dev_examples
+            if self.architecture == "inception_rnn":
+                examples = self.dev_examples
         else:
             filenames = self.epoch_filenames
-            examples = self.epoch_examples
+            if self.architecture == "inception_rnn":
+                examples = self.epoch_examples
 
         for file_idx, file_name in enumerate(filenames):
-            processed_chunk = examples[file_name]
-            # video times (sec)
-            vid_start_time = processed_chunk["start_time"]
-            vid_length = int(processed_chunk["features"].shape[0]/fps)
+            if self.architecture == "inception_rnn":
+                processed_chunk = examples[file_name]
+                # video times (sec)
+                vid_start_time = processed_chunk["start_time"]
+                vid_length = int(processed_chunk["features"].shape[0]/fps)
+            else:
+                fields = annotation_processor.feature_filename_to_fields(file_name)
+                vid_start_time = max(fields["video_chunk_id"] * 600 - 10, 0)
+                vid_subdir = annotation_processor.fields_to_directory(self.video_dir, fields)
+                vid_path = os.path.join(vid_subdir, fields["video_file"])
+                vid = moviepy.editor.VideoFileClip(vid_path, 'ffmpeg')
+                max_length = 600 if fields["video_chunk_id"] == 0 else 610
+                vid_length = min(int(vid.duration - vid_start_time), max_length)
+                print(vid_length)
+
             seizure_times = annotation_processor.seizure_times_from_npz_filename(file_name, self.seizure_annotations)
             for i in range(vid_length - self.window_length):
                 label = self.ground_truth_label(seizure_times,
@@ -373,6 +400,35 @@ class SeizureDetector:
 
         self.pos_example_indices = pos_example_indices
         self.neg_example_indices = neg_example_indices
+
+    def rgb2gray(self, rgb):
+        return np.dot(rgb[..., :3], [0.299, 0.587, 0.114])
+
+    # Take in video clip (subclip) and calculate differences of
+    # frames on interval (diff_int) in number of frames
+    # Return numpy array of differences
+    def frame_difference(self, subclip, diff_int, new_y, new_x):
+        # Calculate num of frames - rounded down to integer
+        num_frames = int(subclip.duration*subclip.fps),
+
+        # get dimensions of subclip
+        [n_y, n_x, n_c] = subclip.get_frame(0).shape
+
+        # Create placeholder for numpy array
+        n_diffs = int(num_frames/diff_int)
+        diff_subclip_np = np.zeros((n_diffs, n_y, n_x), dtype=np.float32)
+
+        # Iterate through slices of subclip and add to numpy array\n",
+        ii = 0
+        for nn in range(0, num_frames - diff_int, diff_int):
+            frame_1 = subclip.get_frame(nn/subclip.fps)
+            frame_0 = subclip.get_frame((nn+diff_int)/subclip.fps)
+            diff_frame = abs(self.rgb2gray(frame_1) - self.rgb2gray(frame_0))
+            diff_resized = skimage.transform.resize(diff_frame, [new_y, new_x])
+            diff_subclip_np[ii, :, :] = np.float32(diff_resized)
+            ii += 1
+
+        return diff_subclip_np
 
     def indices_to_example(self, pair, dev=False, fps=30):
         file_index = pair[0]
@@ -407,6 +463,14 @@ class SeizureDetector:
             batch_x[i, :, :] = self.indices_to_example(pair)
 
         return batch_x, batch_y
+
+    def build_3d_conv_net(self, rnn_size,
+                                false_neg_pen,
+                                learning_rate,
+                                reg_pen,
+                                input_size=1536,
+                                output_size=1):
+        pass
 
     def build_inception_rnn_net(self, rnn_size,
                                 false_neg_pen,
