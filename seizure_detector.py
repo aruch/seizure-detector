@@ -3,6 +3,7 @@ Neural network model for rat/moust seizure detection
 """
 import logging
 import annotation_processor
+import time
 import numpy as np
 import random
 import skimage
@@ -13,10 +14,84 @@ import tqdm
 import math
 import moviepy
 import moviepy.editor
+import multiprocessing
 
 import tensorflow as tf
 import json
 
+def ground_truth_label(seizure_array, window_start, window_length):
+    # Check if sliding window overlaps with seizure window
+    for k in seizure_array:
+        # Here just hard-coded 10 sec as minimum duration of seizure
+        if (window_start + window_length > k) and (window_start < k):
+            return 1
+        # Windows after the 10 sec minimum duration of seizure and less than 120 secs after seizure start
+        if (window_start >= k) and (window_start < k + 120):
+            return -1
+        
+        # Return 0 for non-seizure windows
+    return 0
+
+def epoch_positive_negative_times(args):
+    filenames, seizure_annotations, window_length, vid_dir = args
+    fps = 29.97
+    # wait until we've loaded all examples
+    pos_example_indices = []
+    neg_example_indices = []
+    
+    for file_idx, file_name in enumerate(filenames):
+        fields = annotation_processor.feature_filename_to_fields(file_name)
+        vid_start_time = max(fields["video_chunk_id"] * 600 - 10, 0)
+        vid_subdir = annotation_processor.fields_to_directory(vid_dir, fields)
+        vid_path = os.path.join(vid_subdir, fields["video_file"])
+        vid = moviepy.editor.VideoFileClip(vid_path, 'ffmpeg')
+        max_length = 600 if fields["video_chunk_id"] == 0 else 610
+        vid_length = min(int(vid.duration - vid_start_time), max_length)
+        vid.close()
+        seizure_times = annotation_processor.seizure_times_from_npz_filename(file_name, seizure_annotations)
+        for i in range(vid_length - window_length):
+            label = ground_truth_label(seizure_times,
+                                       vid_start_time + i,
+                                       window_length)
+            if label == 0:
+                neg_example_indices.append((file_idx, i))
+            elif label == 1:
+                pos_example_indices.append((file_idx, i))
+
+    return pos_example_indices, neg_example_indices, filenames
+
+
+def parallel_epoch_positive_negative_times(filenames,
+                                           seizure_annotations,
+                                           window_length,
+                                           video_dir):
+    chunk_size = math.ceil(len(filenames)/POOL_SIZE)
+
+    fnames_chunked = []
+    
+    for i in range(POOL_SIZE):
+        chunk_start = i*chunk_size
+        chunk_end = min((i + 1) * chunk_size, len(filenames))
+        fnames_chunked.append((filenames[chunk_start:chunk_end],
+                               seizure_annotations,
+                               window_length,
+                               video_dir, ))
+
+    res = pool.map(epoch_positive_negative_times, fnames_chunked)
+    n_files = 0
+    pos_times = []
+    neg_times = []
+    filenames = []
+    for args in res:
+        pos_times += [(x[0] + n_files, x[1]) for x in args[0]]
+        neg_times += [(x[0] + n_files, x[1]) for x in args[1]]
+        filenames += args[2]
+        n_files += len(args[2])
+
+    return pos_times, neg_times, filenames
+
+POOL_SIZE = 16
+pool = multiprocessing.Pool(POOL_SIZE)
 
 class SeizureDetector:
     def __init__(self, architecture="inception_rnn", model_dir="models"):
@@ -54,6 +129,9 @@ class SeizureDetector:
         self.feature_dir = feature_dir
         self.video_dir = video_dir
         self.seizure_annotations = annotation_processor.load_seizure_annotations(annotation_file)
+
+        with open("position_annotations.json") as f:
+            self.position_annotations = json.load(f)
         self.train_files = list(train_files)
         self.dev_files = list(dev_files)
 
@@ -139,41 +217,46 @@ class SeizureDetector:
     def set_n_minibatches(self):
         n_positive_examples = len(self.pos_example_indices)
         x = n_positive_examples/self.pos_p
-        if self.rnn_size == 512:
-            z = 16
-        elif self.rnn_size == 256:
-            z = 4
-        elif self.rnn_size == 128:
-            z = 2
-        else:
-            z = 1
-        z *= self.batch_size / 64
-        z *= self.window_length / 10
 
-        self.n_minibatches = min(int(x/self.batch_size) * 5, int(1000/z))
+        # we're calling an epoch seeing each positive example 5
+        # times
+        self.n_minibatches = int(x/self.batch_size) * 5
 
     def setup_dev(self):
         if self.architecture == "inception_rnn":
             epoch = "dev"
             self.loaders[epoch].join()
             self.dev_examples = self.epoch_example_dict[epoch]
-        print("building dev times")
-        self.epoch_positive_negative_times(dev=True)
-        print("done building dev times")
+            self.epoch_positive_negative_times(dev=True)
+        else:
+            return
+            pos_times, neg_times, filenames = parallel_epoch_positive_negative_times(
+                self.epoch_filenames, self.seizure_annotations,
+                self.window_length, self.video_dir
+            )
+            self.pos_example_indices = pos_times
+            self.neg_example_indices = neg_times
+            self.epoch_filenames = filenames
 
     def setup_epoch(self, epoch):
         if self.architecture == "inception_rnn":
             self.loaders[epoch].join()
             self.epoch_examples = self.epoch_example_dict[epoch]
-            
+
             if epoch > 0:
                 del self.epoch_example_dict[epoch - 1]
 
             self.epoch_filenames = list(self.epoch_examples.keys())
+            self.epoch_positive_negative_times()
+        else:
+            pos_times, neg_times, filenames = parallel_epoch_positive_negative_times(
+                self.epoch_filenames, self.seizure_annotations,
+                self.window_length, self.video_dir
+            )
+            self.pos_example_indices = pos_times
+            self.neg_example_indices = neg_times
+            self.epoch_filenames = filenames
 
-        print("building epoch times")
-        self.epoch_positive_negative_times()
-        print("done building epoch times")
         self.set_n_minibatches()
 
     def get_dev_stats(self):
@@ -358,7 +441,7 @@ class SeizureDetector:
 
         # Return 0 for non-seizure windows
         return 0
-    
+
     def epoch_positive_negative_times(self, dev=False, fps=29.97):
         # wait until we've loaded all examples
         pos_example_indices = []
@@ -366,28 +449,16 @@ class SeizureDetector:
 
         if dev:
             filenames = self.dev_files
-            if self.architecture == "inception_rnn":
-                examples = self.dev_examples
+            examples = self.dev_examples
         else:
             filenames = self.epoch_filenames
-            if self.architecture == "inception_rnn":
-                examples = self.epoch_examples
-
+            examples = self.epoch_examples
+                
         for file_idx, file_name in enumerate(filenames):
-            if self.architecture == "inception_rnn":
-                processed_chunk = examples[file_name]
-                # video times (sec)
-                vid_start_time = processed_chunk["start_time"]
-                vid_length = int(processed_chunk["features"].shape[0]/fps)
-            else:
-                fields = annotation_processor.feature_filename_to_fields(file_name)
-                vid_start_time = max(fields["video_chunk_id"] * 600 - 10, 0)
-                vid_subdir = annotation_processor.fields_to_directory(self.video_dir, fields)
-                vid_path = os.path.join(vid_subdir, fields["video_file"])
-                vid = moviepy.editor.VideoFileClip(vid_path, 'ffmpeg')
-                max_length = 600 if fields["video_chunk_id"] == 0 else 610
-                vid_length = min(int(vid.duration - vid_start_time), max_length)
-                print(vid_length)
+            processed_chunk = examples[file_name]
+            # video times (sec)
+            vid_start_time = processed_chunk["start_time"]
+            vid_length = int(processed_chunk["features"].shape[0]/fps)
 
             seizure_times = annotation_processor.seizure_times_from_npz_filename(file_name, self.seizure_annotations)
             for i in range(vid_length - self.window_length):
@@ -409,23 +480,24 @@ class SeizureDetector:
     # Return numpy array of differences
     def frame_difference(self, subclip, diff_int, new_y, new_x):
         # Calculate num of frames - rounded down to integer
-        num_frames = int(subclip.duration*subclip.fps),
+        num_frames = math.ceil(subclip.duration*subclip.fps) - 1
 
         # get dimensions of subclip
-        [n_y, n_x, n_c] = subclip.get_frame(0).shape
+        frame_0 = subclip.get_frame(0)
+        [n_y, n_x, n_c] = frame_0.shape
 
         # Create placeholder for numpy array
         n_diffs = int(num_frames/diff_int)
-        diff_subclip_np = np.zeros((n_diffs, n_y, n_x), dtype=np.float32)
+        diff_subclip_np = np.zeros((n_diffs, new_y, new_x), dtype=np.float32)
 
         # Iterate through slices of subclip and add to numpy array\n",
         ii = 0
         for nn in range(0, num_frames - diff_int, diff_int):
-            frame_1 = subclip.get_frame(nn/subclip.fps)
-            frame_0 = subclip.get_frame((nn+diff_int)/subclip.fps)
+            frame_1 = subclip.get_frame((nn+diff_int)/subclip.fps)
             diff_frame = abs(self.rgb2gray(frame_1) - self.rgb2gray(frame_0))
             diff_resized = skimage.transform.resize(diff_frame, [new_y, new_x])
             diff_subclip_np[ii, :, :] = np.float32(diff_resized)
+            frame_0 = frame_1
             ii += 1
 
         return diff_subclip_np
@@ -433,13 +505,31 @@ class SeizureDetector:
     def indices_to_example(self, pair, dev=False, fps=30):
         file_index = pair[0]
         time_index = pair[1]
-        if dev:
-            example_index = self.dev_files[file_index]
-            features = self.dev_examples[example_index]['features']
-        else:
-            example_index = self.epoch_filenames[file_index]
-            features = self.epoch_examples[example_index]['features']
-        return features[time_index:time_index+self.window_length*fps]
+        if self.architecture == "inception_rnn":
+            if dev:
+                example_index = self.dev_files[file_index]
+                features = self.dev_examples[example_index]['features']
+            else:
+                example_index = self.epoch_filenames[file_index]
+                features = self.epoch_examples[example_index]['features']
+            return features[time_index:time_index+self.window_length*fps]
+
+        fields = annotation_processor.feature_filename_to_fields(self.epoch_filenames[file_index])
+
+        vid_start_time = max(fields["video_chunk_id"] * 600 - 10, 0)
+        vid_subdir = annotation_processor.fields_to_directory(self.video_dir, fields)
+        vid_path = os.path.join(vid_subdir, fields["video_file"])
+        vid = moviepy.editor.VideoFileClip(vid_path, 'ffmpeg')
+        cage_positions = self.position_annotations[fields["position"]][fields["animal_id"]]
+
+        vid_clip = vid.subclip(time_index, time_index + self.window_length)
+
+        clip = moviepy.video.fx.all.crop(
+            vid_clip, x1=cage_positions["x1"], y1=cage_positions["y1"],
+            x2=cage_positions["x2"], y2=cage_positions["y2"]
+        )
+
+        return self.frame_difference(clip, 15, 100, 100)
 
     def generate_minibatch(self):
         num_pos_examples = int(self.batch_size*self.pos_p)
@@ -450,7 +540,10 @@ class SeizureDetector:
         neg_examples = random.choices(self.neg_example_indices,
                                       k=num_neg_examples)
 
-        batch_x = np.zeros((self.batch_size, self.window_length * 30, 1536))
+        if self.architecture == "inception_rnn":
+            batch_x = np.zeros((self.batch_size, self.window_length * 30, 1536))
+        else:
+            batch_x = np.zeros((self.batch_size, self.window_length * 2 - 1, 100, 100))
         batch_y = np.zeros((self.batch_size, 1))
 
         for i in range(self.batch_size):
@@ -460,7 +553,10 @@ class SeizureDetector:
             else:
                 pair = neg_examples[i - num_pos_examples]
                 batch_y[i] = 0
-            batch_x[i, :, :] = self.indices_to_example(pair)
+            print("getting example")
+            t0 = time.time()
+            batch_x[i, :, :, :] = self.indices_to_example(pair)
+            print("got {:.3f}".format(time.time() - t0))
 
         return batch_x, batch_y
 
